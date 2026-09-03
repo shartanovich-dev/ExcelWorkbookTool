@@ -1,0 +1,18 @@
+# Virtual Environment and Cache
+venv/
+__pycache__/
+*.pyc
+
+# Processing and Mapping Directories
+Input/*
+Output/*
+Mappings/*
+
+# Keep the folder structures intact in the repo without uploading their files
+!Input/.gitkeep
+!Output/.gitkeep
+!Mappings/.gitkeep
+
+# Excel temporary ghost files
+~$*.xlsx
+~$*.xlsm
