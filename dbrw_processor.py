@@ -584,6 +584,7 @@ def process_workbook_xml(input_file_bytes, ram_mappings):
         final_xml_str = header_text + modified_inner_str + footer_text
         output_zip.writestr(sheet_path, final_xml_str.encode('utf-8'))
 
+
     if structural_files['xl/workbook.xml'] and audit_log:
         try:
             def escape_xml(text):
