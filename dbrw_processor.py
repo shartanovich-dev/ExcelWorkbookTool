@@ -9,6 +9,13 @@ NS_URL = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'
 NS = {'s': NS_URL}
 ET.register_namespace('', NS_URL)
 
+# --- UPDATED: BULLETPROOF EXCEL REGEX PATTERNS ---
+# Extracts parameters while respecting quote marks and nested unquoted parentheses
+DBRW_EXTRACT_RGX = r'(?:_xll\.)?DBRW\s*\(((?:[^)("\']|"[^"]*"|\'[^\']*\'|\([^)]*\))*)\)'
+# Targets full DBRW blocks for replacement, consuming @ symbols and ignoring nested parentheses
+DBRW_SUB_RGX = r'@?(?:_xll\.)?DBRW\s*\((?:[^)("\']|"[^"]*"|\'[^\']*\'|\([^)]*\))*\)'
+# -------------------------------------------------
+
 def normalize_account_name(acct_str):
     if not acct_str:
         return ""
@@ -140,7 +147,6 @@ def process_workbook_xml(input_file_bytes, ram_mappings):
     audit_log = {}
 
     for sheet_path, tab_name in sheet_info:
-        # Extract sheet number to cross-reference with Excel repair logs
         sheet_num_match = re.search(r'sheet(\d+)\.xml', sheet_path, re.IGNORECASE)
         sheet_num = sheet_num_match.group(1) if sheet_num_match else "Unknown"
         
@@ -189,9 +195,11 @@ def process_workbook_xml(input_file_bytes, ram_mappings):
             continue
 
         audit_log[tab_name] = {'Evaluated': 0, 'Converted': 0, 'Exceptions': 0, 'Incomplete': 0, 'Unmapped': 0, 'Duplicates': 0}
-        seen_wd_combos = set()
+        seen_wd_combos = {}
+        popped_si_values = set()
 
-        params_match = re.search(r'DBRW\s*\((.*)\)', dbrw_formula_text, re.IGNORECASE)
+        # --- UPDATED: USE DBRW_EXTRACT_RGX ---
+        params_match = re.search(DBRW_EXTRACT_RGX, dbrw_formula_text, re.IGNORECASE)
         extracted_cube = None
         params = []
         
@@ -199,6 +207,12 @@ def process_workbook_xml(input_file_bytes, ram_mappings):
             params = split_dbrw_params(params_match.group(1))
             if params:
                 param_1 = params[0].strip()
+                
+                if '!' in param_1:
+                    print(f"  └─ Skipped: Cross-sheet reference detected ({param_1})")
+                    output_zip.writestr(sheet_path, raw_sheet_bytes)
+                    continue
+                
                 if re.match(r'^\$?[A-Z]+\$?\d+$', param_1, re.IGNORECASE):
                     extracted_cube = get_cell_value(sheet_tree, param_1, shared_strings)
                 else:
@@ -228,7 +242,6 @@ def process_workbook_xml(input_file_bytes, ram_mappings):
         account_idx    = mapping_data['account_index']
         dz_headers     = mapping_data['dropzone_headers']
 
-        # Determine MAX COLUMN to calculate offsets for Tag and Dropzones
         max_col_idx = 0
         for cell in sheet_tree.findall('.//s:c', NS):
             col_let = parse_col_letter(cell.attrib.get('r', 'A'))
@@ -236,7 +249,6 @@ def process_workbook_xml(input_file_bytes, ram_mappings):
             if idx > max_col_idx:
                 max_col_idx = idx
 
-        # Column offsets: VBA tag is exactly at +1, Dropzones start at +2
         vba_col_idx = max_col_idx + 1
         start_dz_idx = max_col_idx + 2
 
@@ -248,7 +260,8 @@ def process_workbook_xml(input_file_bytes, ram_mappings):
         for cell in sheet_tree.findall('.//s:c', NS):
             f_tag = cell.find('s:f', NS)
             if f_tag is not None and f_tag.text and 'DBRW' in f_tag.text.upper():
-                p_match = re.search(r'DBRW\s*\((.*)\)', f_tag.text, re.IGNORECASE)
+                # --- UPDATED: USE DBRW_EXTRACT_RGX ---
+                p_match = re.search(DBRW_EXTRACT_RGX, f_tag.text, re.IGNORECASE)
                 if p_match:
                     p_list = split_dbrw_params(p_match.group(1))
                     if len(p_list) >= account_idx:
@@ -352,32 +365,52 @@ def process_workbook_xml(input_file_bytes, ram_mappings):
                 f_tag = cell.find('s:f', NS)
                 if f_tag is not None and f_tag.text and 'DBRW' in f_tag.text.upper():
                     old_formula = f_tag.text
-                    p_match = re.search(r'DBRW\s*\((.*)\)', old_formula, re.IGNORECASE)
+                    
+                    # --- UPDATED: DYNAMIC MULTI-DBRW REPLACER (BASE ROW) ---
+                    p_match = re.search(DBRW_EXTRACT_RGX, old_formula, re.IGNORECASE)
                     
                     if p_match:
-                        extracted_params = split_dbrw_params(p_match.group(1))
-                        new_blueprint = tab3_blueprint
-                        for idx, p_val in enumerate(extracted_params):
-                            new_blueprint = new_blueprint.replace(f"{{Param_{idx}}}", p_val)
-                            
-                        for header_name, col_let in dz_col_map.items():
-                            new_blueprint = new_blueprint.replace(f"{{{header_name}}}", f"${col_let}{row_num}")
+                        primary_cube_ref = param_1.replace('$', '').upper()
                         
-                        for old_val, new_val in tab2_context.items():
-                            new_blueprint = new_blueprint.replace(old_val, new_val)
+                        def base_replacer(match):
+                            full_match = match.group(0)
+                            inner_m = re.search(DBRW_EXTRACT_RGX, full_match, re.IGNORECASE)
+                            if not inner_m: return full_match
+                            
+                            local_params = split_dbrw_params(inner_m.group(1))
+                            if not local_params: return full_match
+                            
+                            cur_cube = local_params[0].strip().replace('$', '').upper()
+                            if cur_cube != primary_cube_ref:
+                                return full_match 
+                            
+                            local_bp = tab3_blueprint.lstrip('=')
+                            for idx, p_val in enumerate(local_params):
+                                local_bp = local_bp.replace(f"{{Param_{idx}}}", p_val)
+                            for header_name, col_let in dz_col_map.items():
+                                local_bp = local_bp.replace(f"{{{header_name}}}", f"${col_let}{row_num}")
+                            for old_val, new_val in tab2_context.items():
+                                local_bp = local_bp.replace(old_val, new_val)
+                            return local_bp
 
                         updated_formula = re.sub(
-                            r'_xll\.DBRW\s*\([^)]*\)|DBRW\s*\([^)]*\)', 
-                            new_blueprint, 
+                            DBRW_SUB_RGX, 
+                            base_replacer, 
                             old_formula, 
                             flags=re.IGNORECASE
                         )
 
+                        si_val = f_tag.attrib.get('si')
+                        if si_val is not None:
+                            popped_si_values.add(si_val)
+
                         updated_formula = updated_formula.lstrip('=')
+                        
                         f_tag.text = updated_formula
                         f_tag.attrib.pop('t', None)
                         f_tag.attrib.pop('si', None)
                         f_tag.attrib.pop('ref', None)
+                        # -------------------------------------------------------
 
                         v_tag = cell.find('s:v', NS)
                         if v_tag is not None:
@@ -396,15 +429,14 @@ def process_workbook_xml(input_file_bytes, ram_mappings):
                     wd_account = wd_account_1
                     dz_values = [cat_1] + [""] * (len(dz_headers) - 1)
                     
-                    # --- NEW DUPLICATE CHECK FOR EXCEPTION BASE ROW ---
                     combo = (wd_account, tuple(dz_values))
                     if combo in seen_wd_combos:
-                        dz_values = ["[DUPLICATE]"] * len(dz_headers)
-                        is_scenario_1 = False 
-                        audit_log[tab_name]['Duplicates'] += 1
+                        if seen_wd_combos[combo] != normalized_account_val:
+                            dz_values = ["[DUPLICATE]"] * len(dz_headers)
+                            is_scenario_1 = False 
+                            audit_log[tab_name]['Duplicates'] += 1
                     else:
-                        seen_wd_combos.add(combo)
-                    # --------------------------------------------------
+                        seen_wd_combos[combo] = normalized_account_val
                     
                     for split_wd, split_cat in exception_list[1:]:
                         max_row += 1
@@ -412,14 +444,12 @@ def process_workbook_xml(input_file_bytes, ram_mappings):
                         cloned_row = copy.deepcopy(base_row_snapshot)
                         cloned_row.attrib['r'] = new_row_num
                         
-                        # 1. Update Clone Coordinates
                         for cell in cloned_row.findall('s:c', NS):
                             old_ref = cell.attrib.get('r', '')
                             if old_ref:
                                 col_let = parse_col_letter(old_ref)
                                 cell.attrib['r'] = f"{col_let}{new_row_num}"
                                 
-                        # 2. Inject Clone Account Name
                         if account_col_letter:
                             target_ref = f"{account_col_letter}{new_row_num}"
                             acct_cell = None
@@ -435,17 +465,15 @@ def process_workbook_xml(input_file_bytes, ram_mappings):
                             for child in list(acct_cell): acct_cell.remove(child)
                             ET.SubElement(ET.SubElement(acct_cell, f'{{{NS_URL}}}is'), f'{{{NS_URL}}}t').text = str(split_wd)
                             
-                        # 3. Inject Clone Dropzones
                         dz_values_clone = [split_cat] + [""] * (len(dz_headers) - 1)
                         
-                        # --- NEW DUPLICATE CHECK FOR CLONED ROW ---
                         combo_clone = (split_wd, tuple(dz_values_clone))
                         if combo_clone in seen_wd_combos:
-                            dz_values_clone = ["[DUPLICATE]"] * len(dz_headers)
-                            audit_log[tab_name]['Duplicates'] += 1
+                            if seen_wd_combos[combo_clone] != normalized_account_val:
+                                dz_values_clone = ["[DUPLICATE]"] * len(dz_headers)
+                                audit_log[tab_name]['Duplicates'] += 1
                         else:
-                            seen_wd_combos.add(combo_clone)
-                        # ------------------------------------------
+                            seen_wd_combos[combo_clone] = normalized_account_val
                         
                         for h_idx, dz_val in enumerate(dz_values_clone):
                             target_dz_col = dz_col_map[dz_headers[h_idx]]
@@ -457,52 +485,74 @@ def process_workbook_xml(input_file_bytes, ram_mappings):
                             ET.SubElement(ET.SubElement(dz_cell, f'{{{NS_URL}}}is'), f'{{{NS_URL}}}t').text = str(dz_val)
                             cloned_row.append(dz_cell)
                             
-                        # 4. Update Clone Formulas & Wipe Shared Formulas
                         for cell in cloned_row.findall('s:c', NS):
                             f_tag = cell.find('s:f', NS)
                             if f_tag is not None:
-                                # Wipe out Excel shared formulas (e.g. SUMs) entirely in the clone to avoid corruption
                                 if not (f_tag.text and 'DBRW' in f_tag.text.upper()):
                                     cell.remove(f_tag)
                                     v_tag = cell.find('s:v', NS)
                                     if v_tag is not None:
                                         cell.remove(v_tag)
                                 else:
-                                    # Handle DBRW Updates normally
                                     old_formula = f_tag.text
-                                    p_match = re.search(r'DBRW\s*\((.*)\)', old_formula, re.IGNORECASE)
+                                    
+                                    # --- UPDATED: DYNAMIC MULTI-DBRW REPLACER (CLONED ROW) ---
+                                    p_match = re.search(DBRW_EXTRACT_RGX, old_formula, re.IGNORECASE)
                                     if p_match:
-                                        extracted_params = split_dbrw_params(p_match.group(1))
-                                        new_blueprint = tab3_blueprint
-                                        for idx, p_val in enumerate(extracted_params):
-                                            p_val_renumbered = re.sub(r'(\$?[A-Z]+\$?)' + str(row_num) + r'\b', r'\g<1>' + new_row_num, p_val, flags=re.IGNORECASE)
-                                            new_blueprint = new_blueprint.replace(f"{{Param_{idx}}}", p_val_renumbered)
-                                            
-                                        for header_name, col_let in dz_col_map.items():
-                                            new_blueprint = new_blueprint.replace(f"{{{header_name}}}", f"${col_let}{new_row_num}")
+                                        primary_cube_ref = param_1.replace('$', '').upper()
                                         
-                                        for old_val, new_val in tab2_context.items():
-                                            new_blueprint = new_blueprint.replace(old_val, new_val)
+                                        def clone_replacer(match):
+                                            full_match = match.group(0)
+                                            inner_m = re.search(DBRW_EXTRACT_RGX, full_match, re.IGNORECASE)
+                                            if not inner_m: return full_match
+                                            
+                                            local_params = split_dbrw_params(inner_m.group(1))
+                                            if not local_params: return full_match
+                                            
+                                            cur_cube = local_params[0].strip().replace('$', '').upper()
+                                            if cur_cube != primary_cube_ref:
+                                                return full_match
+                                            
+                                            local_bp = tab3_blueprint.lstrip('=')
+                                            for idx, p_val in enumerate(local_params):
+                                                p_val_renum = re.sub(r'(\$?[A-Z]+\$?)' + str(row_num) + r'\b', r'\g<1>' + new_row_num, p_val, flags=re.IGNORECASE)
+                                                local_bp = local_bp.replace(f"{{Param_{idx}}}", p_val_renum)
+                                                
+                                            for header_name, col_let in dz_col_map.items():
+                                                local_bp = local_bp.replace(f"{{{header_name}}}", f"${col_let}{new_row_num}")
+                                            for old_val, new_val in tab2_context.items():
+                                                local_bp = local_bp.replace(old_val, new_val)
+                                            return local_bp
 
-                                        updated_formula = re.sub(r'_xll\.DBRW\s*\([^)]*\)|DBRW\s*\([^)]*\)', new_blueprint, old_formula, flags=re.IGNORECASE)
+                                        updated_formula = re.sub(
+                                            DBRW_SUB_RGX, 
+                                            clone_replacer, 
+                                            old_formula, 
+                                            flags=re.IGNORECASE
+                                        )
+
+                                        si_val = f_tag.attrib.get('si')
+                                        if si_val is not None:
+                                            popped_si_values.add(si_val)
+
                                         updated_formula = updated_formula.lstrip('=')
+                                        
                                         f_tag.text = updated_formula
                                         f_tag.attrib.pop('t', None)
                                         f_tag.attrib.pop('si', None)
                                         f_tag.attrib.pop('ref', None)
+                                        # ---------------------------------------------------------
 
                                         v_tag = cell.find('s:v', NS)
                                         if v_tag is not None:
                                             cell.remove(v_tag)
 
-                        # 5. Append VBA Tag dynamically at Max Column + 1
                         vba_col_let = get_col_letter(vba_col_idx)
                         vba_cell_ref = f"{vba_col_let}{new_row_num}"
                         vba_cell = ET.Element(f'{{{NS_URL}}}c', {'r': vba_cell_ref, 't': 'inlineStr'})
                         ET.SubElement(ET.SubElement(vba_cell, f'{{{NS_URL}}}is'), f'{{{NS_URL}}}t').text = f"[INSERT_BELOW_{row_num}]"
                         cloned_row.append(vba_cell)
                         
-                        # 6. Sort cells & Add to buffer
                         cells_c = [c for c in cloned_row if c.tag == f'{{{NS_URL}}}c']
                         cells_c.sort(key=lambda c: col_letter_to_idx(parse_col_letter(c.attrib.get('r', 'A'))))
                         for c in cells_c: cloned_row.remove(c)
@@ -526,11 +576,14 @@ def process_workbook_xml(input_file_bytes, ram_mappings):
                         
                         combo = (wd_account, tuple(dz_values))
                         if combo in seen_wd_combos:
-                            dz_values = ["[DUPLICATE]"] * len(dz_headers)
-                            is_scenario_1 = False 
-                            audit_log[tab_name]['Duplicates'] += 1
+                            if seen_wd_combos[combo] != normalized_account_val:
+                                dz_values = ["[DUPLICATE]"] * len(dz_headers)
+                                is_scenario_1 = False 
+                                audit_log[tab_name]['Duplicates'] += 1
+                            else:
+                                audit_log[tab_name]['Converted'] += 1
                         else:
-                            seen_wd_combos.add(combo)
+                            seen_wd_combos[combo] = normalized_account_val
                             audit_log[tab_name]['Converted'] += 1
                 else:
                     dz_values = ["Unmapped"] * len(dz_headers)
@@ -567,7 +620,14 @@ def process_workbook_xml(input_file_bytes, ram_mappings):
         for clone in cloned_rows_buffer:
             sheet_tree.append(clone)
 
-        # --- UPDATED CONSOLE LOGGING OUTPUT ---
+        if popped_si_values:
+            for cell in sheet_tree.findall('.//s:c', NS):
+                f_tag = cell.find('s:f', NS)
+                if f_tag is not None and f_tag.attrib.get('t') == 'shared':
+                    child_si = f_tag.attrib.get('si')
+                    if child_si in popped_si_values and f_tag.text is None:
+                        cell.remove(f_tag)
+
         if tab_name in audit_log:
             stats = audit_log[tab_name]
             print(f"  ├─ Evaluated:  {stats['Evaluated']}")

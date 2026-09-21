@@ -122,7 +122,7 @@ def main():
         processed_bytes = process_workbook_xml(input_bytes, ram_mappings)
 
         name_only, ext = os.path.splitext(file_name)
-        new_file_name = f"{name_only}_Blueprint{ext}"
+        new_file_name = f"{name_only}_Converted{ext}"
         output_path = os.path.join(OUTPUT_DIR, new_file_name)
         
         with open(output_path, "wb") as f:
