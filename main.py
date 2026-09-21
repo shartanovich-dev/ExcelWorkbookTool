@@ -12,15 +12,9 @@ OUTPUT_DIR = "./Output"
 def normalize_account_name(acct_str):
     if not acct_str:
         return ""
-    
-    # 1. Convert to string and force uppercase
     s = str(acct_str).upper()
-    
-    # 2. Destroy EVERYTHING that is not a standard letter or number
     s = re.sub(r'[^A-Z0-9]', '', s)
-    
     return s
-
 
 def load_ram_mappings():
     """Reads all Mapping_{cubename}.xlsx files from /Mappings into memory."""
@@ -41,7 +35,6 @@ def load_ram_mappings():
         tab1_accounts = {}
         tab_exceptions = {}
 
-        # STEP 1: Gather ALL mappings for each account into a temporary dictionary
         raw_mappings = {}
         for row in ws1.iter_rows(min_row=2, values_only=True):
             if not row or row[0] is None:
@@ -59,25 +52,18 @@ def load_ram_mappings():
             
             raw_mappings[legacy_acct].append((wd_acct, dz_vals))
 
-        # STEP 2: The Smart Filter (Removes "All Categories" from splits)
+        # Route to 1-to-1 or Exception dictionaries
         for legacy_acct, mappings in raw_mappings.items():
-
-            # STEP 3: Route to the final dictionaries based on the cleaned count
             if len(mappings) == 1:
-                # Single mapping -> Send to standard 1-to-1 list
                 tab1_accounts[legacy_acct] = mappings[0]
             else:
-                # Still multiple mappings -> Send to Exceptions (1-to-Many) list
                 ex_list = []
                 for wd, dz in mappings:
                     cat_str = dz[0] if dz[0] is not None else ""
                     ex_list.append((wd, cat_str))
                 tab_exceptions[legacy_acct] = ex_list
 
-        # --- TAB 1B: Exception_Mapping HAS BEEN PERMANENTLY REMOVED ---
-        # The script is now blind to this tab and will only process Account_Mapping
-
-        # --- TAB 2: Context_Mapping ---
+        # --- TAB 2: Context_Mapping (Unified Context & Element Mappings) ---
         ws2 = wb["Context_Mapping"]
         tab2_context = {}
         for row in ws2.iter_rows(min_row=2, values_only=True):
@@ -110,7 +96,6 @@ def main():
     for file_path in input_files:
         file_name = os.path.basename(file_path)
         
-        # SKIP TEMPORARY FILES TO AVOID CRASHES
         if file_name.startswith("~$"):
             continue
             
