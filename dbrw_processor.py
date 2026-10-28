@@ -9,9 +9,10 @@ NS_URL = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'
 NS = {'s': NS_URL}
 ET.register_namespace('', NS_URL)
 
-# --- BULLETPROOF EXCEL REGEX PATTERNS ---
-DBRW_EXTRACT_RGX = r'(?:_xll\.)?DBRW\s*\(((?:[^)("\']|"[^"]*"|\'[^\']*\'|\([^)]*\))*)\)'
-DBRW_SUB_RGX = r'@?(?:_xll\.)?DBRW\s*\((?:[^)("\']|"[^"]*"|\'[^\']*\'|\([^)]*\))*\)'
+# --- BULLETPROOF EXCEL REGEX PATTERNS (DYNAMIC TO PREVENT UI CORRUPTION) ---
+PIPE = chr(124)
+DBRW_EXTRACT_RGX = r'(?:_xll\.)?DBRW\s*\(((?:[^)("\']' + PIPE + r'"[^"]*"' + PIPE + r'\'[^\']*\'' + PIPE + r'\([^)]*\))*)\)'
+DBRW_SUB_RGX = r'@?(?:_xll\.)?DBRW\s*\((?:[^)("\']' + PIPE + r'"[^"]*"' + PIPE + r'\'[^\']*\'' + PIPE + r'\([^)]*\))*\)'
 
 # --- UTILITY HELPER FUNCTIONS ---
 def normalize_account_name(acct_str):
@@ -35,11 +36,17 @@ def col_letter_to_idx(col_let):
     return idx
 
 def parse_col_letter(cell_ref):
-    match = re.match(r"([A-Z]+)", cell_ref, re.IGNORECASE)
+    if not cell_ref:
+        return "A"
+    clean = str(cell_ref).split('!')[-1].replace('$', '')
+    match = re.match(r"([A-Z]+)", clean, re.IGNORECASE)
     return match.group(1).upper() if match else "A"
 
 def parse_row_num(cell_ref):
-    match = re.match(r"[A-Z]+(\d+)", cell_ref, re.IGNORECASE)
+    if not cell_ref:
+        return "1"
+    clean = str(cell_ref).split('!')[-1].replace('$', '')
+    match = re.match(r"[A-Z]+(\d+)", clean, re.IGNORECASE)
     return match.group(1) if match else "1"
 
 def split_dbrw_params(param_str):
@@ -240,7 +247,7 @@ def process_workbook_xml(input_file_bytes, ram_mappings):
             
             audit_log[tab_name] = {
                 'Acct_Col': 'N/A', 'DZ_Cols': 'N/A',
-                'Evaluated': 0, 'Converted': 0, 'Exceptions': 0, 'Incomplete': 0, 'Unmapped': 0, 'Duplicates': 0
+                'Evaluated': 0, 'Converted': 0, 'Exceptions': 0, 'Incomplete': 0, 'Unmapped': 0, 'Duplicates': 0, 'Unlocked_Refs': 0
             }
         except ET.ParseError:
             pass
@@ -249,6 +256,7 @@ def process_workbook_xml(input_file_bytes, ram_mappings):
     cube_cache_hits = {}   
     header_cache = {}
     header_cache_hits = {}  
+    master_category_map = {}
     
     account_val_cache = {}
     account_updated_cache = set()
@@ -331,9 +339,17 @@ def process_workbook_xml(input_file_bytes, ram_mappings):
             idx = col_letter_to_idx(col_let)
             if idx > max_col_idx:
                 max_col_idx = idx
-                
-        vba_col_idx = max_col_idx + 1
-        start_dz_idx = max_col_idx + 2
+
+        # --- DYNAMIC OFFSET: PREVENT GRID COLLISIONS ---
+        horizontal_clone_offset = 0
+        for r_key, r_data in ram_mappings.items():
+            if 'tab_exceptions' in r_data:
+                for exc_list in r_data['tab_exceptions'].values():
+                    if len(exc_list) > 1:
+                        horizontal_clone_offset += (len(exc_list) - 1)
+                        
+        vba_col_idx = max_col_idx + horizontal_clone_offset + 5
+        start_dz_idx = vba_col_idx + 1
 
         max_row = 0
         for r_elem in sheet_tree.findall('.//s:row', NS):
@@ -350,9 +366,344 @@ def process_workbook_xml(input_file_bytes, ram_mappings):
         header_data_row = ET.Element(f'{{{NS_URL}}}row', {'r': header_data_row_num})
         max_row += 1 
         
+        category_data_row_num = str(max_row + 1)
+        max_row += 1 
+        
         header_conflict_col_idx = 2
         header_row_has_data = False
 
+        # ==========================================
+        # STEP 1 - THE TOPOGRAPHICAL PRE-SCAN
+        # ==========================================
+        horizontal_accounts_to_map = []
+        fixed_accounts_to_map = []
+        
+        lowest_cube_row = float('inf')
+        lowest_account_row = float('inf')
+
+        for r_elem in sheet_tree.findall('.//s:row', NS):
+            for cell in r_elem.findall('.//s:c', NS):
+                f_tag = cell.find('s:f', NS)
+                if f_tag is not None and f_tag.text and 'DBRW' in f_tag.text.upper():
+                    p_match = re.search(DBRW_EXTRACT_RGX, f_tag.text, re.IGNORECASE)
+                    if not p_match: continue
+                    
+                    params = split_dbrw_params(p_match.group(1))
+                    if not params: continue
+
+                    raw_cube = params[0].strip('"').strip("'")
+                    clean_cube_ref = raw_cube.split('!')[-1].replace('$', '')
+                    if bool(re.match(r'^[A-Z]+\d+$', clean_cube_ref, re.IGNORECASE)):
+                        c_row = int(parse_row_num(clean_cube_ref))
+                        if c_row < lowest_cube_row: 
+                            lowest_cube_row = c_row
+                    
+                    matched_cube_key = None
+                    clean_cube = raw_cube.strip('"').strip("'")
+                    is_cube_ref = bool(re.match(r'^(\'?[^\']+\'?!)?\$?[A-Z]+\$?\d+$', clean_cube, re.IGNORECASE))
+                    
+                    if is_cube_ref:
+                        parts = clean_cube.split('!') if '!' in clean_cube else [tab_name, clean_cube]
+                        start_tab = parts[0].strip("'") if len(parts) > 1 else tab_name
+                        start_ref = parts[-1].replace('$', '').upper()
+                        
+                        final_tab, final_ref, tgt_cell, tgt_f = resolve_target_cell(start_tab, start_ref, ram_sheets, ram_cell_maps)
+                        
+                        if tgt_cell is not None:
+                            if tgt_f is not None and tgt_f.text and any(x in tgt_f.text.upper() for x in ['VIEW', 'TM1RPTVIEW']):
+                                for r_key in ram_mappings.keys():
+                                    if r_key.lower() in tgt_f.text.lower():
+                                        matched_cube_key = r_key
+                                        break
+                            else:
+                                val = get_cell_value(tgt_cell, shared_strings)
+                                if val:
+                                    for r_key in ram_mappings.keys():
+                                        if r_key.lower() in val.lower():
+                                            matched_cube_key = r_key
+                                            break
+                    else:
+                        for r_key in ram_mappings.keys():
+                            if r_key.lower() in clean_cube.lower():
+                                matched_cube_key = r_key
+                                break
+
+                    if matched_cube_key and matched_cube_key in ram_mappings:
+                        account_idx = ram_mappings[matched_cube_key]['account_index']
+                        
+                        if len(params) >= account_idx:
+                            raw_acct = params[account_idx - 1].strip('"').strip("'")
+                            clean_acct_ref = raw_acct.split('!')[-1].replace('$', '')
+                            
+                            if bool(re.match(r'^[A-Z]+\d+$', clean_acct_ref, re.IGNORECASE)):
+                                a_row = int(parse_row_num(clean_acct_ref))
+                                if a_row < lowest_account_row:
+                                    lowest_account_row = a_row
+                                
+                                ref_only = raw_acct.split('!')[-1].strip()
+                                has_col_lock = ref_only.startswith('$')
+                                has_row_lock = bool(re.search(r'\$\d+$', ref_only))
+                                
+                                acct_ref_clean = raw_acct.replace('$', '').upper()
+                                if '!' in acct_ref_clean:
+                                    target_tab, ref = acct_ref_clean.split('!')
+                                    target_tab = target_tab.strip("'")
+                                    acct_key = f"{target_tab}!{ref}"
+                                else:
+                                    acct_key = f"{tab_name}!{acct_ref_clean}"
+
+                                if has_col_lock and has_row_lock:
+                                    fixed_accounts_to_map.append(acct_key)
+                                elif has_row_lock and not has_col_lock:
+                                    horizontal_accounts_to_map.append(acct_key)
+                                elif not has_col_lock and not has_row_lock:
+                                    audit_log[tab_name]['Unlocked_Refs'] += 1
+
+        if lowest_cube_row == float('inf'): lowest_cube_row = 1
+        if lowest_account_row == float('inf'): lowest_account_row = 1
+        
+        fixed_accounts_to_map = list(dict.fromkeys(fixed_accounts_to_map))
+        horizontal_accounts_to_map = list(dict.fromkeys(horizontal_accounts_to_map))
+        
+        # ==========================================
+        # STEP 2 - THE OCCUPANCY LEDGER (CATEGORY MAP)
+        # ==========================================
+        category_map = {}
+        claimed_columns = {} 
+
+        # Start the row completely empty
+        category_data_row = ET.Element(f'{{{NS_URL}}}row', {'r': category_data_row_num})
+
+        def get_free_column(start_col_idx, acct_val):
+            test_idx = start_col_idx
+            while test_idx in claimed_columns:
+                if claimed_columns[test_idx] == acct_val:
+                    return test_idx 
+                test_idx += 1
+            claimed_columns[test_idx] = acct_val
+            return test_idx
+
+        for acct_key in fixed_accounts_to_map:
+            target_tab, ref_part = acct_key.split('!')
+            # CHANGED: Traces the reference to get the true cell before reading value
+            res_tab, res_ref, tgt_acct_cell, _ = resolve_target_cell(target_tab, ref_part, ram_sheets, ram_cell_maps)
+            res_cache_key = f"{res_tab}!{res_ref}"
+            
+            if res_cache_key in account_val_cache:
+                acct_val = account_val_cache[res_cache_key]
+            else:
+                acct_val = get_cell_value(tgt_acct_cell, shared_strings)
+                account_val_cache[res_cache_key] = acct_val
+                
+            acct_val_norm = normalize_account_name(acct_val) if acct_val else acct_key
+            
+            native_col_letter = parse_col_letter(ref_part)
+            native_col_idx = col_letter_to_idx(native_col_letter)
+            
+            free_col_idx = get_free_column(native_col_idx, acct_val_norm)
+            free_col_letter = get_col_letter(free_col_idx)
+            category_map[acct_key] = f"{free_col_letter}{category_data_row_num}"
+
+        for acct_key in horizontal_accounts_to_map:
+            target_tab, ref_part = acct_key.split('!')
+            # CHANGED: Traces the reference to get the true cell before reading value
+            res_tab, res_ref, tgt_acct_cell, _ = resolve_target_cell(target_tab, ref_part, ram_sheets, ram_cell_maps)
+            res_cache_key = f"{res_tab}!{res_ref}"
+            
+            if res_cache_key in account_val_cache:
+                acct_val = account_val_cache[res_cache_key]
+            else:
+                acct_val = get_cell_value(tgt_acct_cell, shared_strings)
+                account_val_cache[res_cache_key] = acct_val
+                
+            acct_val_norm = normalize_account_name(acct_val) if acct_val else acct_key
+            
+            native_col_letter = parse_col_letter(ref_part)
+            native_col_idx = col_letter_to_idx(native_col_letter)
+            
+            free_col_idx = get_free_column(native_col_idx, acct_val_norm)
+            free_col_letter = get_col_letter(free_col_idx)
+            category_map[acct_key] = f"{free_col_letter}{category_data_row_num}"
+
+        if 'Unlocked_Refs' not in audit_log[tab_name]:
+            audit_log[tab_name]['Unlocked_Refs'] = 0
+            
+        master_category_map.update(category_map)
+
+        # ==========================================
+        # STEP 2.5 - HORIZONTAL COLUMN CLONING (GROUPED BY COLUMN)
+        # ==========================================
+        col_to_accounts = {}
+        for acct_key in horizontal_accounts_to_map:
+            target_tab, ref_part = acct_key.split('!')
+            if target_tab != tab_name:
+                continue
+
+            # CHANGED: Traces the reference to get the true cell before reading value
+            res_tab, res_ref, tgt_acct_cell, _ = resolve_target_cell(target_tab, ref_part, ram_sheets, ram_cell_maps)
+            res_cache_key = f"{res_tab}!{res_ref}"
+            
+            if res_cache_key in account_val_cache:
+                account_val = account_val_cache[res_cache_key]
+            else:
+                account_val = get_cell_value(tgt_acct_cell, shared_strings)
+                account_val_cache[res_cache_key] = account_val
+                
+            normalized_account_val = normalize_account_name(account_val) if account_val else None
+
+            exception_list = None
+            for r_key, r_data in ram_mappings.items():
+                if normalized_account_val in r_data.get('tab_exceptions', {}):
+                    exception_list = r_data['tab_exceptions'][normalized_account_val]
+                    break
+
+            orig_col_let = parse_col_letter(ref_part)
+            acct_row_num = parse_row_num(ref_part)
+
+            if orig_col_let not in col_to_accounts:
+                col_to_accounts[orig_col_let] = []
+            col_to_accounts[orig_col_let].append({
+                'ref_part': ref_part,
+                'acct_row_num': acct_row_num,
+                'account_val': account_val,
+                'normalized': normalized_account_val,
+                'exception_list': exception_list
+            })
+
+        for orig_col_let, acct_list in col_to_accounts.items():
+            max_splits = 0
+            for item in acct_list:
+                exc = item['exception_list']
+                if exc and len(exc) > 1:
+                    if len(exc) - 1 > max_splits:
+                        max_splits = len(exc) - 1
+
+            if max_splits == 0:
+                continue
+
+            required_header_rows = set(item['acct_row_num'] for item in acct_list)
+            dbrw_rows = set()
+            calc_rows = set()
+
+            for r_elem in sheet_tree.findall('.//s:row', NS):
+                r_num = r_elem.attrib.get('r')
+                if not r_num:
+                    continue
+
+                c_elem = None
+                for c in r_elem.findall('s:c', NS):
+                    if parse_col_letter(c.attrib.get('r', 'A')) == orig_col_let:
+                        c_elem = c
+                        break
+
+                if c_elem is not None:
+                    f_tag = c_elem.find('s:f', NS)
+                    if f_tag is not None and f_tag.text:
+                        if 'DBRW' in f_tag.text.upper():
+                            p_match = re.search(DBRW_EXTRACT_RGX, f_tag.text, re.IGNORECASE)
+                            if p_match:
+                                dbrw_rows.add(r_num)
+                                params = split_dbrw_params(p_match.group(1))
+                                for param in params:
+                                    clean_param = param.strip().strip('"').strip("'")
+                                    clean_ref = clean_param.split('!')[-1].replace('$', '')
+                                    if re.match(r'^[A-Z]+\d+$', clean_ref, re.IGNORECASE):
+                                        p_col = parse_col_letter(clean_ref)
+                                        p_row = parse_row_num(clean_ref)
+                                        if p_col == orig_col_let:
+                                            required_header_rows.add(p_row)
+                        else:
+                            calc_rows.add(r_num)
+
+            required_rows = required_header_rows.union(dbrw_rows).union(calc_rows)
+
+            acct_split_lookup = {}
+            for item in acct_list:
+                exc = item['exception_list']
+                if exc and len(exc) > 1:
+                    acct_split_lookup[item['acct_row_num']] = exc[1:]
+                else:
+                    acct_split_lookup[item['acct_row_num']] = []
+
+            for split_idx in range(max_splits):
+                max_col_idx += 1
+                new_col_let = get_col_letter(max_col_idx)
+
+                row_1 = None
+                for r_elem in sheet_tree.findall('.//s:row', NS):
+                    if r_elem.attrib.get('r') == '1':
+                        row_1 = r_elem
+                        break
+                if row_1 is None:
+                    row_1 = ET.Element(f'{{{NS_URL}}}row', {'r': '1'})
+                    sheet_tree.insert(0, row_1)
+
+                anchor_cell = ET.Element(f'{{{NS_URL}}}c', {'r': f'{new_col_let}1', 't': 'inlineStr'})
+                ET.SubElement(ET.SubElement(anchor_cell, f'{{{NS_URL}}}is'), f'{{{NS_URL}}}t').text = f"[INSERT_RIGHT_OF_{orig_col_let}]"
+                row_1.append(anchor_cell)
+
+                chosen_split_cat = ""
+
+                for r_num in required_rows:
+                    r_elem = None
+                    for row in sheet_tree.findall('.//s:row', NS):
+                        if row.attrib.get('r') == r_num:
+                            r_elem = row
+                            break
+                    if r_elem is None:
+                        continue
+
+                    orig_cell = None
+                    for c in r_elem.findall('s:c', NS):
+                        if parse_col_letter(c.attrib.get('r', 'A')) == orig_col_let:
+                            orig_cell = c
+                            break
+
+                    if orig_cell is not None:
+                        new_cell = copy.deepcopy(orig_cell)
+                        new_cell.attrib['r'] = f"{new_col_let}{r_num}"
+
+                        if r_num in acct_split_lookup and acct_split_lookup[r_num]:
+                            splits = acct_split_lookup[r_num]
+                            if split_idx < len(splits):
+                                split_wd, split_cat = splits[split_idx]
+                                new_cell.attrib['t'] = 'inlineStr'
+                                for child in list(new_cell):
+                                    new_cell.remove(child)
+                                ET.SubElement(ET.SubElement(new_cell, f'{{{NS_URL}}}is'), f'{{{NS_URL}}}t').text = str(split_wd)
+                                if not chosen_split_cat and split_cat:
+                                    chosen_split_cat = split_cat
+
+                        elif r_num in dbrw_rows or r_num in calc_rows:
+                            f_tag = new_cell.find('s:f', NS)
+                            if f_tag is not None and f_tag.text:
+                                pattern = r'(?<![A-Za-z])(\$?)(' + orig_col_let + r')(\$?\d+)(?![A-Za-z])'
+                                shifted_formula = re.sub(pattern, rf'\g<1>{new_col_let}\g<3>', f_tag.text, flags=re.IGNORECASE)
+                                f_tag.text = shifted_formula
+
+                                v_tag = new_cell.find('s:v', NS)
+                                if v_tag is not None:
+                                    new_cell.remove(v_tag)
+                                new_cell.attrib.pop('t', None)
+                                f_tag.attrib.pop('t', None)
+                                f_tag.attrib.pop('si', None)
+                                f_tag.attrib.pop('ref', None)
+
+                        r_elem.append(new_cell)
+
+                for item in acct_list:
+                    new_acct_key = f"{tab_name}!{new_col_let}{item['acct_row_num']}"
+                    category_map[new_acct_key] = f"{new_col_let}{category_data_row_num}"
+                    master_category_map[new_acct_key] = f"{new_col_let}{category_data_row_num}"
+
+                if chosen_split_cat:
+                    dz_cell = ET.Element(f'{{{NS_URL}}}c', {'r': f"{new_col_let}{category_data_row_num}", 't': 'inlineStr'})
+                    ET.SubElement(ET.SubElement(dz_cell, f'{{{NS_URL}}}is'), f'{{{NS_URL}}}t').text = str(chosen_split_cat)
+                    category_data_row.append(dz_cell)
+
+        # ==========================================
+        # PASS 2: MAIN CELL ITERATION
+        # ==========================================
         for row in sheet_tree.findall('.//s:row', NS):
             row_num_str = row.attrib.get('r')
             if not row_num_str:
@@ -375,9 +726,6 @@ def process_workbook_xml(input_file_bytes, ram_mappings):
                     if not params:
                         continue
                         
-                    # ==========================================
-                    # PHASE 3 - CUBE RESOLUTION
-                    # ==========================================
                     raw_cube_param = params[0].strip()
                     clean_param = raw_cube_param.strip('"').strip("'")
                     
@@ -493,9 +841,6 @@ def process_workbook_xml(input_file_bytes, ram_mappings):
                     mapped_params = list(params)
                     account_param_raw = None
                     
-                    # ==========================================
-                    # PHASE 4 - HEADER RESOLUTION & CACHE UPDATE
-                    # ==========================================
                     for p_idx, raw_param in enumerate(params):
                         if p_idx == 0:
                             continue
@@ -586,17 +931,39 @@ def process_workbook_xml(input_file_bytes, ram_mappings):
                                     if tgt_cell is not None:
                                         if is_subnm:
                                             subnm_match = re.search(r'(?:_xll\.)?SUBNM\s*\((.*)\)', tgt_f.text, re.IGNORECASE)
-                                            extracted_element = "SUBNM" # Default fallback
+                                            extracted_element = "SUBNM" 
                                             
                                             if subnm_match:
                                                 subnm_params = split_dbrw_params(subnm_match.group(1))
                                                 
-                                                # Extract the 3rd parameter (Index 2) before we lose the original context
+                                                # PASS 1: Apply standard translations (e.g. ytd_ReportingAmount -> YTD)
+                                                for s_idx, s_val in enumerate(subnm_params):
+                                                    
+                                                    # --- NESTED DBRA INTERCEPT ---
+                                                    if "DBRA" in s_val.upper():
+                                                        dbra_match = re.search(r'DBRA\s*\(\s*["\']?([^"\']+)["\']?', s_val, re.IGNORECASE)
+                                                        if dbra_match:
+                                                            full_dim = dbra_match.group(1).upper()
+                                                            base_dim = full_dim.split(':')[-1] if ':' in full_dim else full_dim
+                                                            
+                                                            protected_dims = ["PERIOD"] # Add new dimensions here
+                                                            
+                                                            if base_dim in protected_dims:
+                                                                continue # Skip mapping to protect the dimension name
+                                                    # -----------------------------
+                                                    
+                                                    subnm_params[s_idx] = apply_context_replacements(s_val, tab2_context)
+                                                
+                                                # Grab the translated value for the cache
                                                 if len(subnm_params) > 2:
                                                     extracted_element = subnm_params[2].replace('"', '').replace("'", "").strip()
                                                     
-                                                for s_idx, s_val in enumerate(subnm_params):
-                                                    subnm_params[s_idx] = apply_context_replacements(s_val, tab2_context)
+                                                # PASS 2: If it's a PandL cube and we found YTD, translate it to PTD for the cell
+                                                if matched_cube_key and 'PANDL' in matched_cube_key.upper():
+                                                    if extracted_element.upper() in ["YTD", "YTD_CDN", "PTD_CDN"]:
+                                                        if len(subnm_params) > 2:
+                                                            subnm_params[2] = apply_context_replacements(subnm_params[2], tab2_context)
+                                                            
                                                 tgt_f.text = f'SUBNM({",".join(subnm_params)})'
                                                 tgt_v = tgt_cell.find('s:v', NS)
                                                 if tgt_v is not None:
@@ -604,7 +971,7 @@ def process_workbook_xml(input_file_bytes, ram_mappings):
                                                 tgt_cell.attrib.pop('t', None)  
                                                 modified_tabs.add(final_tab)
                                                 
-                                            # Write the actual element (e.g., "YTD") to the cache so the sniffer finds it
+                                            # Cache securely receives "YTD" while the physical cell gets "PTD"
                                             header_cache[cache_key] = extracted_element
                                                 
                                         else:
@@ -622,9 +989,6 @@ def process_workbook_xml(input_file_bytes, ram_mappings):
                         else:
                             mapped_params[p_idx] = apply_context_replacements(raw_param, tab2_context)
 
-                    # ==========================================
-                    # PHASE 4.5 - PANDL YTD SNIFFER
-                    # ==========================================
                     apply_ytd_rule = False
                     if matched_cube_key and 'PANDL' in matched_cube_key.upper():
                         last_param_raw = params[-1]
@@ -650,8 +1014,9 @@ def process_workbook_xml(input_file_bytes, ram_mappings):
                     
                     if account_param_raw:
                         clean_acct_param = account_param_raw.strip('"').strip("'")
+                        clean_acct_ref = clean_acct_param.split('!')[-1].replace('$', '')
                         
-                        if re.match(r'^(\'?[^\']+\'?!)?\$?[A-Z]+\$?\d+$', clean_acct_param, re.IGNORECASE):
+                        if re.match(r'^[A-Z]+\d+$', clean_acct_ref, re.IGNORECASE):
                             acct_target_tab = tab_name
                             acct_target_ref = clean_acct_param
                             
@@ -667,8 +1032,16 @@ def process_workbook_xml(input_file_bytes, ram_mappings):
                             
                             if acct_cache_key not in row_active_clones:
                                 if acct_cache_key not in account_val_cache:
-                                    tgt_acct_cell = ram_cell_maps.get(acct_target_tab, {}).get(acct_target_ref)
-                                    account_val = get_cell_value(tgt_acct_cell, shared_strings)
+                                    # CHANGED: Traces the reference (e.g. =B12) to its source before reading
+                                    res_tab, res_ref, tgt_acct_cell, _ = resolve_target_cell(acct_target_tab, acct_target_ref, ram_sheets, ram_cell_maps)
+                                    res_cache_key = f"{res_tab}!{res_ref}"
+                                    
+                                    if res_cache_key in account_val_cache:
+                                        account_val = account_val_cache[res_cache_key]
+                                    else:
+                                        account_val = get_cell_value(tgt_acct_cell, shared_strings)
+                                        account_val_cache[res_cache_key] = account_val
+                                        
                                     account_val_cache[acct_cache_key] = account_val
                                 else:
                                     account_val = account_val_cache[acct_cache_key]
@@ -676,8 +1049,11 @@ def process_workbook_xml(input_file_bytes, ram_mappings):
                                 normalized_account_val = normalize_account_name(account_val) if account_val else None
                                 is_exception = (normalized_account_val in tab_exceptions) if normalized_account_val else False
                                 
+                                is_vertical_exception = is_exception and acct_cache_key not in horizontal_accounts_to_map
+                                is_horizontal_exception = is_exception and acct_cache_key in horizontal_accounts_to_map
+                                
                                 base_row_snapshot = None
-                                if is_exception:
+                                if is_vertical_exception:
                                     base_row_snapshot = copy.deepcopy(row)
                                 
                                 if account_val:
@@ -685,7 +1061,7 @@ def process_workbook_xml(input_file_bytes, ram_mappings):
                                     is_scenario_1 = False
                                     wd_account = None
                                     
-                                    if is_exception:
+                                    if is_vertical_exception:
                                         audit_log[tab_name]['Exceptions'] += 1
                                         is_scenario_1 = True
                                         exception_list = tab_exceptions[normalized_account_val]
@@ -765,6 +1141,24 @@ def process_workbook_xml(input_file_bytes, ram_mappings):
                                             cloned_rows_buffer.append(cloned_row)
                                             active_clones.append((row_num, new_row_num, cloned_row))
                                             
+                                    elif is_horizontal_exception:
+                                        audit_log[tab_name]['Exceptions'] += 1
+                                        is_scenario_1 = True
+                                        exception_list = tab_exceptions[normalized_account_val]
+                                        
+                                        wd_account_1, cat_1 = exception_list[0]
+                                        wd_account = wd_account_1
+                                        base_dz_values = [cat_1] + [""] * (len(dz_headers) - 1)
+                                        
+                                        combo = (wd_account, tuple(base_dz_values))
+                                        if combo in seen_wd_combos:
+                                            if seen_wd_combos[combo] != normalized_account_val:
+                                                base_dz_values = ["[DUPLICATE]"] * len(dz_headers)
+                                                is_scenario_1 = False 
+                                                audit_log[tab_name]['Duplicates'] += 1
+                                        else:
+                                            seen_wd_combos[combo] = normalized_account_val
+                                            
                                     elif normalized_account_val in tab1_accounts:
                                         wd_account, dz_values_raw = tab1_accounts[normalized_account_val]
                                         
@@ -794,23 +1188,34 @@ def process_workbook_xml(input_file_bytes, ram_mappings):
                                         audit_log[tab_name]['Unmapped'] += 1
 
                                     for h_idx, dz_val in enumerate(base_dz_values):
-                                        target_dz_col = dz_col_map[dz_headers[h_idx]]
-                                        dz_cell_ref = f"{target_dz_col}{row_num}"
                                         
-                                        for existing_c in row.findall('s:c', NS):
-                                            if existing_c.attrib.get('r') == dz_cell_ref:
-                                                row.remove(existing_c)
-                                                break
-                                        
-                                        if str(dz_val).strip() != "":
-                                            dz_cell = ET.Element(f'{{{NS_URL}}}c', {'r': dz_cell_ref, 't': 'inlineStr'})
-                                            ET.SubElement(ET.SubElement(dz_cell, f'{{{NS_URL}}}is'), f'{{{NS_URL}}}t').text = str(dz_val)
-                                            row.append(dz_cell)
-
-                                    cells = [c for c in row if c.tag == f'{{{NS_URL}}}c']
-                                    cells.sort(key=lambda c: col_letter_to_idx(parse_col_letter(c.attrib.get('r', 'A'))))
-                                    for c in cells: row.remove(c)
-                                    row.extend(cells)
+                                        if acct_cache_key in category_map:
+                                            dz_cell_ref = category_map[acct_cache_key]
+                                            
+                                            cell_exists = False
+                                            for existing_c in category_data_row.findall('s:c', NS):
+                                                if existing_c.attrib.get('r') == dz_cell_ref:
+                                                    cell_exists = True
+                                                    break
+                                                    
+                                            if str(dz_val).strip() != "" and not cell_exists:
+                                                dz_cell = ET.Element(f'{{{NS_URL}}}c', {'r': dz_cell_ref, 't': 'inlineStr'})
+                                                ET.SubElement(ET.SubElement(dz_cell, f'{{{NS_URL}}}is'), f'{{{NS_URL}}}t').text = str(dz_val)
+                                                category_data_row.append(dz_cell) 
+                                                
+                                        else:
+                                            target_dz_col = dz_col_map[dz_headers[h_idx]]
+                                            dz_cell_ref = f"{target_dz_col}{row_num}"
+                                            
+                                            for existing_c in row.findall('s:c', NS):
+                                                if existing_c.attrib.get('r') == dz_cell_ref:
+                                                    row.remove(existing_c)
+                                                    break
+                                            
+                                            if str(dz_val).strip() != "":
+                                                dz_cell = ET.Element(f'{{{NS_URL}}}c', {'r': dz_cell_ref, 't': 'inlineStr'})
+                                                ET.SubElement(ET.SubElement(dz_cell, f'{{{NS_URL}}}is'), f'{{{NS_URL}}}t').text = str(dz_val)
+                                                row.append(dz_cell)
                                     
                                     if is_scenario_1 and wd_account is not None:
                                         if acct_cache_key not in account_updated_cache:
@@ -855,8 +1260,24 @@ def process_workbook_xml(input_file_bytes, ram_mappings):
                                 p_val = f'{p_val}&"@@_SFX_99_@@"'
                             local_bp = local_bp.replace(f"{{Param_{idx}}}", p_val)
                             
-                        for header_name, col_let in dz_col_map.items():
-                            local_bp = local_bp.replace(f"{{{header_name}}}", f"${col_let}{row_num}")
+                        local_acct_raw = local_params[account_idx - 1].strip('"').strip("'")
+                        local_acct_key = None
+                        clean_local_ref = local_acct_raw.split('!')[-1].replace('$', '')
+                        if bool(re.match(r'^[A-Z]+\d+$', clean_local_ref, re.IGNORECASE)):
+                            l_parts = local_acct_raw.split('!') if '!' in local_acct_raw else [tab_name, local_acct_raw]
+                            l_tab = l_parts[0].strip("'") if len(l_parts) > 1 else tab_name
+                            l_ref = l_parts[-1].replace('$', '').upper()
+                            local_acct_key = f"{l_tab}!{l_ref}"
+
+                        if local_acct_key and local_acct_key in category_map:
+                            target_ref = category_map[local_acct_key]
+                            target_col = parse_col_letter(target_ref)
+                            target_row = parse_row_num(target_ref)
+                            for header_name in dz_col_map.keys():
+                                local_bp = local_bp.replace(f"{{{header_name}}}", f"${target_col}${target_row}")
+                        else:
+                            for header_name, col_let in dz_col_map.items():
+                                local_bp = local_bp.replace(f"{{{header_name}}}", f"${col_let}{row_num}")
                             
                         local_bp = apply_context_replacements(local_bp, tab2_context)
                         local_bp = local_bp.replace("@@_SFX_99_@@", "YTD")
@@ -941,7 +1362,8 @@ def process_workbook_xml(input_file_bytes, ram_mappings):
                                 is_ytd = False
                                 if 'PANDL' in matched_ck.upper():
                                     last_p = local_params[-1].strip('"').strip("'")
-                                    if re.match(r'^(\'?[^\']+\'?!)?\$?[A-Z]+\$?\d+$', last_p, re.IGNORECASE):
+                                    clean_last_p = last_p.split('!')[-1].replace('$', '')
+                                    if re.match(r'^[A-Z]+\d+$', clean_last_p, re.IGNORECASE):
                                         parts = last_p.split('!') if '!' in last_p else [tab_name, last_p]
                                         temp_tab = parts[0].strip("'") if len(parts) > 1 else tab_name
                                         temp_ref = parts[-1].replace('$', '').upper()
@@ -984,17 +1406,44 @@ def process_workbook_xml(input_file_bytes, ram_mappings):
                             c_cell.remove(c_v_tag)
                         c_cell.attrib.pop('t', None)
 
+        
+        # Safeguard the Header row from appending if it's completely empty
         cells_c = [c for c in header_data_row if c.tag == f'{{{NS_URL}}}c']
-        cells_c.sort(key=lambda c: col_letter_to_idx(parse_col_letter(c.attrib.get('r', 'A'))))
-        for c in cells_c: header_data_row.remove(c)
-        header_data_row.extend(cells_c)
+        if len(cells_c) > 0:
+            cells_c.sort(key=lambda c: col_letter_to_idx(parse_col_letter(c.attrib.get('r', 'A'))))
+            for c in cells_c: header_data_row.remove(c)
+            header_data_row.extend(cells_c)
+            sheet_tree.append(header_data_row)
 
-        sheet_tree.append(header_data_row)
+        # Process the Category row
+        cells_c_cat = [c for c in category_data_row if c.tag == f'{{{NS_URL}}}c']
+        
+        # Only inject the VBA tag and append the row if categories actually exist
+        if len(cells_c_cat) > 0:
+            cat_vba_ref = f"{get_col_letter(vba_col_idx)}{category_data_row_num}"
+            cat_vba_cell = ET.Element(f'{{{NS_URL}}}c', {'r': cat_vba_ref, 't': 'inlineStr'})
+            ET.SubElement(ET.SubElement(cat_vba_cell, f'{{{NS_URL}}}is'), f'{{{NS_URL}}}t').text = f"[INSERT_ABOVE_{lowest_account_row}]"
+            category_data_row.append(cat_vba_cell)
+            
+            # Re-fetch cells to include the new tag, then sort and append
+            cells_c_cat = [c for c in category_data_row if c.tag == f'{{{NS_URL}}}c']
+            cells_c_cat.sort(key=lambda c: col_letter_to_idx(parse_col_letter(c.attrib.get('r', 'A'))))
+            for c in cells_c_cat: category_data_row.remove(c)
+            category_data_row.extend(cells_c_cat)
+            
+            sheet_tree.append(category_data_row)
 
         for clone in cloned_rows_buffer:
             sheet_tree.append(clone)
 
+        # Global Sorter to prevent XML corruption after arbitrary cell injections
         for r_elem in sheet_tree.findall('.//s:row', NS):
+            cells_c = [c for c in r_elem if c.tag == f'{{{NS_URL}}}c']
+            if cells_c:
+                cells_c.sort(key=lambda c: col_letter_to_idx(parse_col_letter(c.attrib.get('r', 'A'))))
+                for c in cells_c: r_elem.remove(c)
+                r_elem.extend(cells_c)
+            
             for c_elem in list(r_elem):
                 if c_elem.tag == f'{{{NS_URL}}}c' and len(list(c_elem)) == 0 and not c_elem.text and 's' not in c_elem.attrib:
                     r_elem.remove(c_elem)
@@ -1067,7 +1516,7 @@ def process_workbook_xml(input_file_bytes, ram_mappings):
             audit_xml += f'<worksheet xmlns="{NS_URL}">\n'
             audit_xml += '<sheetData>\n'
             
-            headers = ['Sheet Name', 'Account Column', 'Dropzone Column(s)', 'Total Evaluated', 'Converted (Success)', 'Exceptions', 'Incomplete Match', 'Unmapped (Orphans)', 'Duplicates Suppressed']
+            headers = ['Sheet Name', 'Account Column', 'Dropzone Column(s)', 'Total Evaluated', 'Converted (Success)', 'Exceptions', 'Incomplete Match', 'Unmapped (Orphans)', 'Duplicates Suppressed', 'Unlocked Refs']
             audit_xml += '<row r="1">\n'
             for col_idx, header_val in enumerate(headers, start=1):
                 col_let = get_col_letter(col_idx)
@@ -1095,7 +1544,8 @@ def process_workbook_xml(input_file_bytes, ram_mappings):
                     stats['Exceptions'],
                     stats['Incomplete'],
                     stats['Unmapped'],
-                    stats['Duplicates']
+                    stats['Duplicates'],
+                    stats.get('Unlocked_Refs', 0)
                 ]
                 
                 for i, num_val in enumerate(numeric_stats, start=4):
@@ -1121,7 +1571,10 @@ def process_workbook_xml(input_file_bytes, ram_mappings):
                 output_zip.writestr(f_name, f_data)
 
     try:
-        yaml_output = "Cube_Cache_State:\n"
+        yaml_output = "Category_Map_State:\n"
+        for k, v in master_category_map.items(): yaml_output += f"  '{k}': '{v}'\n"
+
+        yaml_output += "Cube_Cache_State:\n"
         for k, v in cube_cache.items(): yaml_output += f"  '{k}': '{v}'\n"
         
         yaml_output += "\nCube_Cache_Hits:\n"
