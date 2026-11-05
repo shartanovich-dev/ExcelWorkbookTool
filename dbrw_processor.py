@@ -305,7 +305,7 @@ def process_workbook_xml(input_file_bytes, ram_mappings):
                     if si in shared_formulas:
                         cur_row = parse_row_num(c.attrib.get('r', 'A1'))
                         shifted_text = re.sub(
-                            r'(\$?[A-Za-z]+)' + str(shared_formulas[si]['master_row']) + r'\b', 
+                            r'(\$?[A-Za-z]+)' + str(shared_formulas[si]['master_row']) + r'(?![0-9])', 
                             r'\g<1>' + str(cur_row), 
                             shared_formulas[si]['text'], 
                             flags=re.IGNORECASE
@@ -378,13 +378,22 @@ def process_workbook_xml(input_file_bytes, ram_mappings):
         horizontal_accounts_to_map = []
         fixed_accounts_to_map = []
         
+        # --- NEW TRACKERS: MODULE GROUPING ---
+        dbrw_rows_set = set()
+        row_col_to_accts = {} 
+        row_account_cols = {} 
+        
         lowest_cube_row = float('inf')
         lowest_account_row = float('inf')
+     
 
         for r_elem in sheet_tree.findall('.//s:row', NS):
             for cell in r_elem.findall('.//s:c', NS):
                 f_tag = cell.find('s:f', NS)
                 if f_tag is not None and f_tag.text and 'DBRW' in f_tag.text.upper():
+                    
+                
+                    
                     p_match = re.search(DBRW_EXTRACT_RGX, f_tag.text, re.IGNORECASE)
                     if not p_match: continue
                     
@@ -458,6 +467,27 @@ def process_workbook_xml(input_file_bytes, ram_mappings):
                                     horizontal_accounts_to_map.append(acct_key)
                                 elif not has_col_lock and not has_row_lock:
                                     audit_log[tab_name]['Unlocked_Refs'] += 1
+                                    
+                               # --- NEW LOGIC: POPULATE HEATMAP TRACKERS ---
+                                f_row_str = r_elem.attrib.get('r')
+                                if f_row_str and f_row_str.isdigit():
+                                    f_row_num = int(f_row_str)
+                                    dbrw_rows_set.add(f_row_num)
+                                    
+                                    # ONLY track for vertical collisions (ignore horizontal row locks)
+                                    if not has_row_lock:
+                                        target_tab, ref_part = acct_key.split('!') if '!' in acct_key else (tab_name, acct_key)
+                                        res_tab, res_ref, _, _ = resolve_target_cell(target_tab, ref_part, ram_sheets, ram_cell_maps)
+                                        root_acct_col = parse_col_letter(res_ref)
+                                        
+                                        if f_row_num not in row_account_cols:
+                                            row_account_cols[f_row_num] = set()
+                                        row_account_cols[f_row_num].add(root_acct_col)
+                                        
+                                        rc_key = (f_row_num, root_acct_col)
+                                        if rc_key not in row_col_to_accts:
+                                            row_col_to_accts[rc_key] = set()
+                                        row_col_to_accts[rc_key].add(acct_key)
 
         if lowest_cube_row == float('inf'): lowest_cube_row = 1
         if lowest_account_row == float('inf'): lowest_account_row = 1
@@ -465,6 +495,91 @@ def process_workbook_xml(input_file_bytes, ram_mappings):
         fixed_accounts_to_map = list(dict.fromkeys(fixed_accounts_to_map))
         horizontal_accounts_to_map = list(dict.fromkeys(horizontal_accounts_to_map))
         
+        # --- NEW LOGIC: CALCULATE BLOCKS & COLLISIONS ---
+        dbrw_rows_sorted = sorted(list(dbrw_rows_set))
+        row_to_block = {}
+        current_block = 1
+        block_boundaries = {} 
+        
+        if dbrw_rows_sorted:
+            row_to_block[dbrw_rows_sorted[0]] = current_block
+            block_boundaries[current_block] = {'start': dbrw_rows_sorted[0], 'end': dbrw_rows_sorted[0]}
+            
+            for i in range(1, len(dbrw_rows_sorted)):
+                prev_row = dbrw_rows_sorted[i-1]
+                curr_row = dbrw_rows_sorted[i]
+                
+                # The Tripwire: 3 row numerical difference = 2 consecutive rows without DBRWs
+                if curr_row - prev_row >= 3: 
+                    current_block += 1
+                    block_boundaries[current_block] = {'start': curr_row, 'end': curr_row}
+                else:
+                    block_boundaries[current_block]['end'] = curr_row
+                    
+                row_to_block[curr_row] = current_block
+
+        modular_fixed_accounts = set()
+        block_summaries = {}
+
+        for f_row_num, cols in row_account_cols.items():
+            blk = row_to_block[f_row_num]
+            if blk not in block_summaries:
+                block_summaries[blk] = {'cols': set(), 'collision_rows': 0, 'mismatches': 0, 'potential_fixed': set()}
+                
+            block_summaries[blk]['cols'].update(cols)
+            
+            if len(cols) > 1:
+                block_summaries[blk]['collision_rows'] += 1
+                row_acct_values = set()
+                
+                for col in cols:
+                    accts = row_col_to_accts.get((f_row_num, col), set())
+                    block_summaries[blk]['potential_fixed'].update(accts)
+                    
+                    for acct_key in accts:
+                        target_tab, ref_part = acct_key.split('!') if '!' in acct_key else (tab_name, acct_key)
+                        res_tab, res_ref, tgt_acct_cell, _ = resolve_target_cell(target_tab, ref_part, ram_sheets, ram_cell_maps)
+                        
+                        res_cache_key = f"{res_tab}!{res_ref}"
+                        if res_cache_key in account_val_cache:
+                            val = account_val_cache[res_cache_key]
+                        else:
+                            val = get_cell_value(tgt_acct_cell, shared_strings)
+                            account_val_cache[res_cache_key] = val
+                            
+                        norm_val = normalize_account_name(val) if val else ""
+                        row_acct_values.add(norm_val)
+                        
+                # If there's more than 1 unique account name across columns on this row, it's a true mismatch
+                if len(row_acct_values) > 1:
+                    block_summaries[blk]['mismatches'] += 1
+
+        for blk, b_summary in block_summaries.items():
+            # Only force them to the bottom ledger if there was at least one mismatch in the block
+            if b_summary['collision_rows'] > 0 and b_summary['mismatches'] > 0:
+                modular_fixed_accounts.update(b_summary['potential_fixed'])
+
+        if block_boundaries:
+            print(f"    [DEBUG] Map: Found {len(block_boundaries)} Physical Blocks")
+            for blk, bounds in block_boundaries.items():
+                b_summary = block_summaries.get(blk, {'cols': set(), 'collision_rows': 0, 'mismatches': 0})
+                col_str = ", ".join(sorted(list(b_summary['cols'])))
+                
+                if b_summary['collision_rows'] > 0:
+                    if b_summary['mismatches'] == 0:
+                        col_status = f"MIRRORED MODULE ({b_summary['collision_rows']} rows perfectly matched)"
+                    else:
+                        col_status = f"COLLISION ({b_summary['collision_rows']} overlapping rows, {b_summary['mismatches']} mismatches)"
+                elif len(b_summary['cols']) == 0:
+                    col_status = "Fixed/Horizontal Layout"
+                else:
+                    col_status = "Standard Vertical Layout"
+                    
+                print(f"      - Block {blk} (Rows {bounds['start']}-{bounds['end']}) | Acct Cols: [{col_str}] | {col_status}")
+
+        # --- ROUTE COLLISIONS TO BOTTOM LEDGER ---
+        fixed_accounts_to_map.extend(list(modular_fixed_accounts))
+
         # ==========================================
         # STEP 2 - THE OCCUPANCY LEDGER (CATEGORY MAP)
         # ==========================================
@@ -787,6 +902,12 @@ def process_workbook_xml(input_file_bytes, ram_mappings):
                                                 view_params.insert(insert_pos, '"!"')
                                             else:
                                                 view_params.append('"!"')
+                                                
+                                            # --- CLEANUP: REPLACE #REF! WITH "!" ---
+                                            for v_idx in range(len(view_params)):
+                                                if '#REF!' in view_params[v_idx].upper():
+                                                    view_params[v_idx] = '"!"'
+                                            # ---------------------------------------
                                             
                                             tgt_f.text = f'VIEW({",".join(view_params)})'
                                             tgt_v = tgt_cell.find('s:v', NS)
@@ -960,7 +1081,7 @@ def process_workbook_xml(input_file_bytes, ram_mappings):
                                                     
                                                 # PASS 2: If it's a PandL cube and we found YTD, translate it to PTD for the cell
                                                 if matched_cube_key and 'PANDL' in matched_cube_key.upper():
-                                                    if extracted_element.upper() in ["YTD", "YTD_CDN", "PTD_CDN"]:
+                                                    if extracted_element.upper() in ["YTD", "YTD_CDN"]:
                                                         if len(subnm_params) > 2:
                                                             subnm_params[2] = apply_context_replacements(subnm_params[2], tab2_context)
                                                             
@@ -1004,9 +1125,9 @@ def process_workbook_xml(input_file_bytes, ram_mappings):
                             
                             orig_val = header_cache.get(cache_key)
                             orig_val_str = str(orig_val).strip().upper() if orig_val else ""
-                            if orig_val_str in ["YTD", "YTD_CDN", "PTD_CDN"]:
+                            if orig_val_str in ["YTD", "YTD_CDN"]:
                                 apply_ytd_rule = True
-                        elif clean_last_param.upper().replace("'", "").replace("`", "").strip() in ["YTD", "YTD_CDN", "PTD_CDN"]:
+                        elif clean_last_param.upper().replace("'", "").replace("`", "").strip() in ["YTD", "YTD_CDN"]:
                             apply_ytd_rule = True
 
                     base_dz_values = [""] * len(dz_headers)
@@ -1371,9 +1492,9 @@ def process_workbook_xml(input_file_bytes, ram_mappings):
                                         
                                         orig_val = header_cache.get(c_key)
                                         orig_val_str = str(orig_val).strip().upper() if orig_val else ""
-                                        if orig_val_str in ["YTD", "YTD_CDN", "PTD_CDN"]:
+                                        if orig_val_str in ["YTD", "YTD_CDN"]:
                                             is_ytd = True
-                                    elif last_p.upper().replace("'", "").replace("`", "").strip() in ["YTD", "YTD_CDN", "PTD_CDN"]:
+                                    elif last_p.upper().replace("'", "").replace("`", "").strip() in ["YTD", "YTD_CDN"]:
                                         is_ytd = True
                                         
                                 for idx, p_val in enumerate(local_params):
