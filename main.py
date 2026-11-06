@@ -2,7 +2,7 @@ import os
 import glob
 import openpyxl
 import re
-from dbrw_processor import process_workbook_xml
+from app.dbrw_processor import process_workbook_xml
 
 MAPPINGS_DIR = "./Mappings"
 INPUT_DIR = "./Input"
