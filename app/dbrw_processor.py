@@ -578,7 +578,12 @@ def process_workbook_xml(input_file_bytes, ram_mappings):
                 print(f"      - Block {blk} (Rows {bounds['start']}-{bounds['end']}) | Acct Cols: [{col_str}] | {col_status}")
 
         # --- ROUTE COLLISIONS TO BOTTOM LEDGER ---
-        fixed_accounts_to_map.extend(list(modular_fixed_accounts))
+        # Sorted into sheet order (tab, row, column) so category columns are allocated the same way every run
+        def sheet_order_key(acct_key):
+            acct_tab, acct_ref = acct_key.rsplit('!', 1)
+            return (acct_tab, int(parse_row_num(acct_ref)), col_letter_to_idx(parse_col_letter(acct_ref)))
+
+        fixed_accounts_to_map.extend(sorted(modular_fixed_accounts, key=sheet_order_key))
 
         # ==========================================
         # STEP 2 - THE OCCUPANCY LEDGER (CATEGORY MAP)
@@ -759,7 +764,7 @@ def process_workbook_xml(input_file_bytes, ram_mappings):
 
                 chosen_split_cat = ""
 
-                for r_num in required_rows:
+                for r_num in sorted(required_rows, key=int):
                     r_elem = None
                     for row in sheet_tree.findall('.//s:row', NS):
                         if row.attrib.get('r') == r_num:
