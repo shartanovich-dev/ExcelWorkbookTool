@@ -1,13 +1,12 @@
 import os
 from app import local_store
-from app.config import MAPPINGS_DIR
 from app.dbrw_processor import process_workbook_xml
 from app.mappings import load_ram_mappings
 
 def main():
     local_store.ensure_output_folder()
     print("Loading Mapping files into RAM...")
-    ram_mappings = load_ram_mappings(MAPPINGS_DIR)
+    ram_mappings = load_ram_mappings(local_store.list_mapping_files())
     print(f"Loaded mappings for {len(ram_mappings)} cube(s): {list(ram_mappings.keys())}")
 
     for file_path in local_store.list_input_files():

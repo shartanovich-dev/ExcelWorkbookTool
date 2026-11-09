@@ -2,11 +2,16 @@
 import glob
 import os
 
-from app.config import INPUT_DIR, OUTPUT_DIR
+from app.config import INPUT_DIR, MAPPINGS_DIR, OUTPUT_DIR
 
 
 def ensure_output_folder():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+def list_mapping_files():
+    """(file name, file contents) for each Mapping_*.xlsx in MAPPINGS_DIR."""
+    paths = glob.glob(os.path.join(MAPPINGS_DIR, "Mapping_*.xlsx"))
+    return [(os.path.basename(p), read_bytes(p)) for p in paths]
 
 def list_input_files():
     """Paths of the .xlsx files in INPUT_DIR, skipping Excel's ~$ lock files."""

@@ -1,6 +1,5 @@
-import glob
-import os
 import re
+from io import BytesIO
 
 import openpyxl
 
@@ -13,16 +12,17 @@ def normalize_account_name(acct_str):
     s = re.sub(r'[^A-Z0-9]', '', s)
     return s
 
-def load_ram_mappings(mappings_dir):
-    """Reads all Mapping_{cubename}.xlsx files from mappings_dir into memory."""
-    ram_mappings = {}
-    mapping_files = glob.glob(os.path.join(mappings_dir, "Mapping_*.xlsx"))
+def load_ram_mappings(mapping_files):
+    """Reads Mapping_{cubename}.xlsx files into memory.
 
-    for filepath in mapping_files:
-        filename = os.path.basename(filepath)
+    mapping_files: list of (file name, file contents) pairs.
+    """
+    ram_mappings = {}
+
+    for filename, file_bytes in mapping_files:
         cube_name = filename.replace("Mapping_", "").replace(".xlsx", "").strip()
 
-        wb = openpyxl.load_workbook(filepath, data_only=True)
+        wb = openpyxl.load_workbook(BytesIO(file_bytes), data_only=True)
 
         # --- TAB 1: Account_Mapping ---
         ws1 = wb["Account_Mapping"]
