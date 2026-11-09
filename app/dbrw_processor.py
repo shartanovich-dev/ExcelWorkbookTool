@@ -4,6 +4,8 @@ import zipfile
 import copy
 from io import BytesIO
 
+from app.mappings import normalize_account_name
+
 # XML Namespaces
 NS_URL = 'http://schemas.openxmlformats.org/spreadsheetml/2006/main'
 NS = {'s': NS_URL}
@@ -15,13 +17,6 @@ DBRW_EXTRACT_RGX = r'(?:_xll\.)?DBRW\s*\(((?:[^)("\']' + PIPE + r'"[^"]*"' + PIP
 DBRW_SUB_RGX = r'@?(?:_xll\.)?DBRW\s*\((?:[^)("\']' + PIPE + r'"[^"]*"' + PIPE + r'\'[^\']*\'' + PIPE + r'\([^)]*\))*\)'
 
 # --- UTILITY HELPER FUNCTIONS ---
-def normalize_account_name(acct_str):
-    if not acct_str:
-        return ""
-    s = str(acct_str).upper()
-    s = re.sub(r'[^A-Z0-9]', '', s)
-    return s
-
 def get_col_letter(col_idx):
     result = ""
     while col_idx > 0:
