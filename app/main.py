@@ -1,5 +1,5 @@
 import os
-from app import local_store
+from app import local_store, run_log
 from app.dbrw_processor import process_workbook_xml
 from app.mappings import load_ram_mappings
 
@@ -16,7 +16,8 @@ def main():
 
         input_bytes = local_store.read_bytes(file_path)
 
-        processed_bytes = process_workbook_xml(input_bytes, ram_mappings)
+        processed_bytes, diagnostics_yaml = process_workbook_xml(input_bytes, ram_mappings)
+        run_log.write_diagnostic_log(diagnostics_yaml)
 
         name_only, ext = os.path.splitext(file_name)
         new_file_name = f"{name_only}_Converted{ext}"
