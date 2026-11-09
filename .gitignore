@@ -9,6 +9,7 @@ Output/*
 Mappings/*
 Baseline_output/
 run_console.txt
+Cache_Diagnostic_Log.yaml
 
 # Keep the folder structures intact in the repo without uploading their files
 !Input/.gitkeep
